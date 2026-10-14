@@ -94,6 +94,14 @@ def process_hud_alert(hud_alert):
   return alert_fcw, alert_steer_required
 
 
+# The fork's dynamic pedal tuning is held off while the cruise work is developed. The learner
+# moves the throttle by up to 3x underneath everything else - it winds up to its 3.0 ceiling while
+# the car lags and collapses about three times faster once the car catches up - so any other change
+# is measured against a moving target. With this False the gas is a fixed function of the request
+# against the platform's hand-tuned base. Set True to restore the fork feature.
+HONDA_PEDAL_LEARNING = False
+
+
 class HondaParamWriter:
   def __init__(self):
     self._params = Params()
@@ -142,9 +150,14 @@ class CarController(CarControllerBase):
     self.last_torque = 0.0
     self.bosch_last_gas = 0
 
-    self.gasfactor = 1.0 if (Params().get("HondaGasFactorParams") is None) else Params().get("HondaGasFactorParams")
+    # With learning off, start from 1.0 rather than the persisted value: otherwise the car keeps
+    # whatever the learner last saved (measured often below 1.0) and the throttle is not
+    # deterministic. The persisted values are left alone, so True resumes from them.
+    self.gasfactor = (1.0 if (Params().get("HondaGasFactorParams") is None)
+                      else Params().get("HondaGasFactorParams")) if HONDA_PEDAL_LEARNING else 1.0
     self.gasfactor_before_gasmax = self.gasfactor
-    self.windfactor = 1.0 if (Params().get("HondaWindFactorParams") is None) else Params().get("HondaWindFactorParams")
+    self.windfactor = (1.0 if (Params().get("HondaWindFactorParams") is None)
+                       else Params().get("HondaWindFactorParams")) if HONDA_PEDAL_LEARNING else 1.0
     self.windfactor_before_gasmax = self.windfactor_before_brake = self.windfactor
     self.pitch = 0.0
 
@@ -279,7 +292,7 @@ class CarController(CarControllerBase):
           gas_pedal_force = accel + wind_brake_ms2 * self.windfactor + hill_brake # not using self.accel since pid resets w gas pedal
 
           # live-learn gas pedal adjustments when openpilot is controlling gas
-          if (actuators.longControlState == LongCtrlState.pid) and (not CS.out.gasPressed):
+          if HONDA_PEDAL_LEARNING and (actuators.longControlState == LongCtrlState.pid) and (not CS.out.gasPressed):
             gas_error = accel - CS.out.aEgo
             if gas_error != 0.0 and gas_pedal_force > min_gas:
               if self.CP.carFingerprint in (CAR.HONDA_INSIGHT, CAR.HONDA_CIVIC_BOSCH): # gas pedal reacts too slowly
