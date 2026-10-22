@@ -228,6 +228,7 @@ class CarController(CarControllerBase):
     # wind brake from air resistance decel at high speed
     wind_brake = np.interp(CS.out.vEgo, [0.0, 2.3, 35.0], [0.001, 0.002, 0.15]) * self.windfactor # not in m/s2 units
     wind_brake_ms2 = np.interp(CS.out.vEgo, [0.0, 13.4, 22.4, 31.3, 40.2], [0.000, 0.049, 0.136, 0.267, 0.441]) # in m/s2 units
+    rolling_brake_ms2 = np.interp(CS.out.vEgo, [0.5, 2.0], [0.0, 0.09]) # rolling resistance in m/s2 units, zero at standstill
 
     # all of this is only relevant for HONDA NIDEC
     speed_control = 0
@@ -289,7 +290,7 @@ class CarController(CarControllerBase):
             targetaccel = accel
 
           self.accel = float(np.clip(targetaccel, self.params.BOSCH_ACCEL_MIN, self.params.BOSCH_ACCEL_MAX))
-          gas_pedal_force = accel + wind_brake_ms2 * self.windfactor + hill_brake # not using self.accel since pid resets w gas pedal
+          gas_pedal_force = accel + wind_brake_ms2 * self.windfactor + rolling_brake_ms2 + hill_brake # not using self.accel since pid resets w gas pedal
 
           # live-learn gas pedal adjustments when openpilot is controlling gas
           if HONDA_PEDAL_LEARNING and (actuators.longControlState == LongCtrlState.pid) and (not CS.out.gasPressed):
