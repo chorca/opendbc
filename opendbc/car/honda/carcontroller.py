@@ -1,7 +1,10 @@
+import math
+
 import numpy as np
 
 from opendbc.can import CANPacker
-from opendbc.car import Bus, DT_CTRL, rate_limit, make_tester_present_msg, structs
+from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, rate_limit, make_tester_present_msg, structs
+from opendbc.car.common.pid import PIDController
 from opendbc.car.honda import hondacan
 from opendbc.car.honda.values import CAR, CruiseButtons, HondaFlags, CarControllerParams
 from opendbc.car.interfaces import CarControllerBase
@@ -107,12 +110,28 @@ class CarController(CarControllerBase):
     self.gas = 0.0
     self.brake = 0.0
     self.last_torque = 0.0
+    self.bosch_last_gas = 0
+    self.pitch = 0.0
+
+    # Bosch extra-brake controller: integral brake authority at low speed, where the EBB unit
+    # under-delivers the commanded decel.
+    self.brake_pid = PIDController(k_p=0.0,
+                                   k_i=1.0,
+                                   pos_limit=0.0,
+                                   neg_limit=-2.0,
+                                   rate=50)
+    self.brake_pid.reset()
 
   def update(self, CC, CS, now_nanos):
+    min_gas = self.params.BOSCH_GAS_LOOKUP_BP[0]
     actuators = CC.actuators
     hud_control = CC.hudControl
     hud_v_cruise = hud_control.setSpeed / CS.v_cruise_factor if hud_control.speedVisible else 255
     pcm_cancel_cmd = CC.cruiseControl.cancel
+
+    if len(CC.orientationNED) == 3:
+      self.pitch = CC.orientationNED[1]
+    hill_brake = math.sin(self.pitch) * ACCELERATION_DUE_TO_GRAVITY
 
     if CC.longActive:
       accel = actuators.accel
@@ -153,6 +172,12 @@ class CarController(CarControllerBase):
 
     # wind brake from air resistance decel at high speed
     wind_brake = np.interp(CS.out.vEgo, [0.0, 2.3, 35.0], [0.001, 0.002, 0.15])
+    # Bosch longitudinal road load, in m/s^2: aerodynamic drag plus rolling resistance, which the
+    # pedal force has to overcome before the car holds speed.
+    wind_brake_ms2 = np.interp(CS.out.vEgo, [0.0, 13.4, 22.4, 31.3, 40.2], [0.000, 0.049, 0.136, 0.267, 0.441])
+    rolling_brake_ms2 = np.interp(CS.out.vEgo, [0.5, 2.0], [0.0, 0.09])
+    # stock Honda Bosch engine-overrun coast corridor before friction brakes are requested
+    coast_margin = float(np.interp(CS.out.vEgo, [2.0, 8.0], [0.0, 0.12]))
     # all of this is only relevant for HONDA NIDEC
     max_accel = np.interp(CS.out.vEgo, self.params.NIDEC_MAX_ACCEL_BP, self.params.NIDEC_MAX_ACCEL_V)
     # TODO this 1.44 is just to maintain previous behavior
@@ -195,13 +220,31 @@ class CarController(CarControllerBase):
         ts = self.frame * DT_CTRL
 
         if self.CP.flags & HondaFlags.BOSCH:
-          self.accel = float(np.clip(accel, self.params.BOSCH_ACCEL_MIN, self.params.BOSCH_ACCEL_MAX))
-          self.gas = float(np.interp(accel, self.params.BOSCH_GAS_LOOKUP_BP, self.params.BOSCH_GAS_LOOKUP_V))
+          # extra integral brake while crawling so the car actually reaches zero
+          if (accel < min_gas) and (1e-3 < CS.out.vEgo < 3.0):
+            brake_addon = self.brake_pid.update(error=accel - CS.out.aEgo, speed=CS.out.vEgo)
+            targetaccel = min(accel, accel + brake_addon)
+          else:
+            self.brake_pid.reset()
+            targetaccel = accel
+
+          self.accel = float(np.clip(targetaccel, self.params.BOSCH_ACCEL_MIN, self.params.BOSCH_ACCEL_MAX))
+          # Pedal force is computed from the requested accel (not the PID-adjusted one), so that the
+          # low-speed brake addon cannot push the pedal force around.
+          gas_pedal_force = accel + wind_brake_ms2 + rolling_brake_ms2 + hill_brake
+          if gas_pedal_force < (min_gas - coast_margin) and CS.out.vEgo > 2.0:
+            # friction braking: pre-compensate the Bosch EBB rolling-resistance over-delivery
+            self.accel = float(np.clip(targetaccel + rolling_brake_ms2, self.params.BOSCH_ACCEL_MIN, 0.0))
+
+          self.gas = float(np.interp(gas_pedal_force, self.params.BOSCH_GAS_LOOKUP_BP, self.params.BOSCH_GAS_LOOKUP_V))
+          # limit the gas ramp to 60 units per frame, matching stock; faster steps make the PCM ignore gas
+          self.gas = min(self.gas, max(60, self.bosch_last_gas + 60))
+          self.bosch_last_gas = self.gas
 
           stopping = actuators.longControlState == LongCtrlState.stopping
           self.stopping_counter = self.stopping_counter + 1 if stopping else 0
           can_sends.extend(hondacan.create_acc_commands(self.packer, self.CAN, CC.enabled, CC.longActive, self.accel, self.gas,
-                                                        self.stopping_counter, self.CP))
+                                                        self.stopping_counter, self.CP, gas_pedal_force, coast_margin))
         else:
           apply_brake = np.clip(self.brake_last - wind_brake, 0.0, 1.0)
           apply_brake = int(np.clip(apply_brake * self.params.NIDEC_BRAKE_MAX, 0, self.params.NIDEC_BRAKE_MAX - 1))

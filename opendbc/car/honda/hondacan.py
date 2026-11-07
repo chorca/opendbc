@@ -69,14 +69,16 @@ def create_brake_command(packer, CAN, apply_brake, pump_on, pcm_override, pcm_ca
   return packer.make_can_msg("BRAKE_COMMAND", CAN.pt, values)
 
 
-def create_acc_commands(packer, CAN, enabled, active, accel, gas, stopping_counter, CP):
+def create_acc_commands(packer, CAN, enabled, active, accel, gas, stopping_counter, CP, gas_force, coast_margin=0.0):
   commands = []
   min_gas_accel = CarControllerParams.BOSCH_GAS_LOOKUP_BP[0]
 
   control_on = 5 if enabled else 0
-  gas_command = gas if active and accel > min_gas_accel else -30000
+  # gas_force is the road-load-compensated pedal force: above the min gas point it drives the engine,
+  # inside the coast corridor it is engine overrun only, and below that the Bosch VSA applies friction brakes.
+  gas_command = gas if active and gas_force > min_gas_accel else -30000
   accel_command = accel if active else 0
-  braking = 1 if active and accel < min_gas_accel else 0
+  braking = 1 if active and gas_force < (min_gas_accel - coast_margin) else 0
   standstill = 1 if active and stopping_counter > 0 else 0
   standstill_release = 1 if active and stopping_counter == 0 else 0
 
@@ -84,6 +86,8 @@ def create_acc_commands(packer, CAN, enabled, active, accel, gas, stopping_count
   acc_control_values = {
     'ACCEL_COMMAND': accel_command,
     'STANDSTILL': standstill,
+    # radarless Bosch never reaches the BRAKE_REQUEST line in the else branch below
+    'BRAKE_REQUEST': braking,
   }
 
   if CP.flags & HondaFlags.BOSCH_RADARLESS:
@@ -97,7 +101,6 @@ def create_acc_commands(packer, CAN, enabled, active, accel, gas, stopping_count
       "CONTROL_ON": control_on,
       "GAS_COMMAND": gas_command,  # used for gas
       "BRAKE_LIGHTS": braking,
-      "BRAKE_REQUEST": braking,
       "STANDSTILL_RELEASE": standstill_release,
     })
     acc_control_on_values = {
